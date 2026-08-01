@@ -18,7 +18,7 @@ import { Card, CardBack } from "../components/Card";
 import { SortableCard } from "../components/SortableCard";
 import { ScoreGrid } from "../components/ScoreGrid";
 import { rankChar } from "../cards";
-import type { FieldHandView } from "../store";
+import type { FieldHandView, PendingChoice } from "../store";
 
 export function Table() {
   const store = useBeanie();
@@ -104,9 +104,26 @@ export function Table() {
           </span>
         </div>
         <div className={`turnbar ${myTurn ? "turnbar--mine" : ""}`}>{turnText}</div>
-        <button className="btn btn--small btn--ghost" onClick={() => setShowScores(true)}>
-          📊 Scoreboard
-        </button>
+        <div className="table__header-btns">
+          <div className="volume" title="Sound volume">
+            <span className="volume__icon" aria-hidden="true">
+              {store.volume === 0 ? "🔇" : store.volume < 0.5 ? "🔉" : "🔊"}
+            </span>
+            <input
+              className="volume__slider"
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={store.volume}
+              onChange={(e) => store.setVolume(parseFloat(e.target.value))}
+              aria-label="Sound volume"
+            />
+          </div>
+          <button className="btn btn--small btn--ghost" onClick={() => setShowScores(true)}>
+            📊 Scoreboard
+          </button>
+        </div>
       </header>
 
       {/* players */}
@@ -170,7 +187,13 @@ export function Table() {
               </div>
               <div className="fhand__cards">
                 {f.cards.map((c, i) => (
-                  <Card key={i} rank={c.rank} suit={c.suit} small beanie={c.rank === s.beanieRank} />
+                  <Card
+                    key={i}
+                    rank={c.rank}
+                    suit={c.suit}
+                    small
+                    beanie={c.rank === s.beanieRank}
+                  />
                 ))}
               </div>
               {canInteractField && (
@@ -247,6 +270,16 @@ export function Table() {
         </div>
       </section>
 
+      {/* pick between valid readings of a play/insert (Set vs Run, run ends) */}
+      {store.pendingChoice && (
+        <PlayChoiceModal
+          choice={store.pendingChoice}
+          beanieRank={s.beanieRank}
+          onPick={(seq) => store.resolveChoice(seq)}
+          onCancel={() => store.cancelChoice()}
+        />
+      )}
+
       {/* bonus modal */}
       {bonusPending && s.awaitingBonusSeat === mySeat && (
         <div className="overlay">
@@ -272,13 +305,25 @@ export function Table() {
             <h2>Round {s.round} complete</h2>
             <p>🏆 {s.roundWinnerName} went out{s.lastBonus ? ` (${s.lastBonus} bonus)` : ""}.</p>
             <ScoreGrid players={s.players} bonuses={s.bonuses} currentRound={s.round} />
-            {me?.isHost ? (
-              <button className="btn btn--primary" onClick={() => store.send("nextRound")}>
-                Start round {s.round + 1}
-              </button>
-            ) : (
-              <p className="muted">Waiting for the host to start the next round…</p>
-            )}
+            <div className="ready">
+              <div className="ready__list">
+                {s.players.map((p) => (
+                  <span
+                    key={p.seat}
+                    className={`ready__chip ${p.ready ? "ready__chip--on" : ""}`}
+                  >
+                    {p.ready ? "✓" : "…"} {p.name}
+                  </span>
+                ))}
+              </div>
+              {me?.ready ? (
+                <p className="muted">Waiting for everyone to ready up…</p>
+              ) : (
+                <button className="btn btn--primary" onClick={() => store.send("ready")}>
+                  Ready for round {s.round + 1}
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -315,5 +360,90 @@ function GameWinner({ players }: { players: { name: string; score: number }[] })
     <p className="winner">
       🏆 {winners.join(" & ")} win{winners.length === 1 ? "s" : ""} with {min} points!
     </p>
+  );
+}
+
+/**
+ * Ask the player how to read an ambiguous play/insert. For a play we go two
+ * steps — Set or Run, then which run — when both kinds are on offer; an insert
+ * only ever offers run ends, so it's a single step. Each concrete option is
+ * shown as its actual cards, with Beanies rendered in the rank they'd stand for.
+ */
+function PlayChoiceModal({
+  choice,
+  beanieRank,
+  onPick,
+  onCancel,
+}: {
+  choice: PendingChoice;
+  beanieRank: number;
+  onPick: (seq: string) => void;
+  onCancel: () => void;
+}) {
+  const sets = choice.options.filter((o) => o.kind === "SET");
+  const runs = choice.options.filter((o) => o.kind !== "SET");
+  // Two-step only makes sense when it's a play offering both a set and runs.
+  const twoStep = choice.action === "play" && sets.length > 0 && runs.length > 0;
+  const [kind, setKind] = useState<"SET" | "RUN" | null>(null);
+
+  const title =
+    choice.action === "insert"
+      ? "Which end does the Beanie extend?"
+      : "How do you want to play these cards?";
+
+  // Render one option as its cards. A Beanie shows the rank it stands for (its
+  // assignedRank), keeping its wild styling; in a run it takes the run's suit.
+  const renderOption = (o: PendingChoice["options"][number]) => {
+    const cards = o.cards ?? [];
+    const runSuit = cards.find((c) => c.rank !== beanieRank)?.suit;
+    return (
+      <button
+        key={o.seq}
+        className="btn btn--choice"
+        title={o.label}
+        onClick={() => onPick(o.seq)}
+      >
+        <span className="choice__cards">
+          {cards.map((c, i) => {
+            const isBeanie = c.rank === beanieRank;
+            const rank = isBeanie ? c.assignedRank ?? c.rank : c.rank;
+            const suit =
+              isBeanie && o.kind === "FLUSH" ? runSuit ?? c.suit : c.suit;
+            return <Card key={i} rank={rank} suit={suit} small beanie={isBeanie} />;
+          })}
+        </span>
+      </button>
+    );
+  };
+
+  let body;
+  if (twoStep && kind === null) {
+    body = (
+      <div className="modal__actions">
+        {renderOption(sets[0])}
+        <button className="btn btn--choice btn--choice-more" onClick={() => setKind("RUN")}>
+          Run…
+        </button>
+      </div>
+    );
+  } else {
+    const opts = twoStep ? runs : choice.options;
+    body = (
+      <div className="modal__actions modal__actions--wrap">
+        {opts.map(renderOption)}
+      </div>
+    );
+  }
+
+  return (
+    <div className="overlay">
+      <div className="modal modal--choice">
+        <h2>{title}</h2>
+        {body}
+        <button className="btn btn--ghost" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
   );
 }
