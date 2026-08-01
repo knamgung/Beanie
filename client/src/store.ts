@@ -2,6 +2,7 @@
 // player's private hand. React subscribes via a version counter (see useBeanie).
 
 import { Client, Room } from "colyseus.js";
+import { sound } from "./sound";
 
 // Default to the same host the page was loaded from, so a friend who opens
 // http://192.168.1.20:5173 automatically connects to ws://192.168.1.20:2567.
@@ -22,11 +23,13 @@ export interface PlayerView {
   handCount: number;
   hasPlayed: boolean;
   tookTurn: boolean;
+  ready: boolean;
 }
 
 export interface CardView {
   rank: number;
   suit: string;
+  assignedRank?: number; // rank a Beanie represents in a played hand
 }
 
 export interface FieldHandView {
@@ -69,6 +72,20 @@ export interface HandCard {
   id: string;
 }
 
+/** A play/insert the server needs the player to disambiguate. */
+export interface PendingChoice {
+  action: "play" | "insert";
+  options: {
+    seq: string;
+    label: string;
+    kind?: string;
+    cards?: CardView[]; // placed cards (with assignedRank) for card previews
+  }[];
+  cardIds?: string[]; // play: the cards being played
+  fieldId?: string; // insert: target field hand
+  cardId?: string; // insert: the card being inserted
+}
+
 function toPlain(s: any): Snapshot {
   return {
     phase: s.phase,
@@ -100,12 +117,17 @@ function toPlain(s: any): Snapshot {
       handCount: p.handCount,
       hasPlayed: p.hasPlayed,
       tookTurn: p.tookTurn,
+      ready: p.ready,
     })),
     field: Array.from(s.field, (f: any) => ({
       id: f.id,
       ownerSeat: f.ownerSeat,
       kind: f.kind,
-      cards: Array.from(f.cards, (c: any) => ({ rank: c.rank, suit: c.suit })),
+      cards: Array.from(f.cards, (c: any) => ({
+        rank: c.rank,
+        suit: c.suit,
+        assignedRank: c.assignedRank || c.rank,
+      })),
     })),
     bonuses: Array.from(s.bonuses, (b: any) => ({
       round: b.round,
@@ -117,6 +139,25 @@ function toPlain(s: any): Snapshot {
 
 function bySuitThenRank(a: HandCard, b: HandCard): number {
   return a.suit.localeCompare(b.suit) || a.rank - b.rank;
+}
+
+/** Signature of the whole field; changes iff a hand is played/inserted/reclaimed. */
+function fieldSig(s: Snapshot): string {
+  return s.field
+    .map(
+      (f) =>
+        `${f.id}:${f.cards
+          .map((c) => `${c.suit}${c.rank}>${c.assignedRank ?? c.rank}`)
+          .join(",")}`
+    )
+    .join("|");
+}
+
+/** Signature of the discard-pile top; changes on a discard or a discard-draw. */
+function discardSig(s: Snapshot): string {
+  return s.hasDiscard && s.discardTop
+    ? `${s.discardTop.rank}-${s.discardTop.suit}`
+    : "none";
 }
 
 const SESSION_KEY = "beanie:session";
@@ -133,12 +174,14 @@ class BeanieStore {
   private order: string[] = []; // player's chosen left-to-right hand order (card ids)
   error: string | null = null;
   notice: string | null = null;
+  pendingChoice: PendingChoice | null = null;
   connecting = false;
   sessionId = "";
   roomCode = "";
 
   version = 0;
   private listeners = new Set<() => void>();
+  private wasMyTurn = false; // rising-edge tracking for the turn-start sound
 
   subscribe = (l: () => void) => {
     this.listeners.add(l);
@@ -152,6 +195,61 @@ class BeanieStore {
 
   get mySeat(): number {
     return this.snapshot?.players.find((p) => p.id === this.sessionId)?.seat ?? -1;
+  }
+
+  /**
+   * Play sound effects driven by state transitions, by diffing the previous
+   * snapshot against the new one. Skipped on the first snapshot (and on a
+   * resume, where prev is null) so rejoining doesn't replay a burst of sounds.
+   */
+  private playTransitionSounds(prev: Snapshot | null, next: Snapshot) {
+    const mySeat =
+      next.players.find((p) => p.id === this.sessionId)?.seat ?? -1;
+    const isMyTurn = next.phase === "PLAYING" && next.turnSeat === mySeat;
+
+    // First snapshot (initial load / resume): record turn ownership, no sound.
+    if (!prev) {
+      this.wasMyTurn = isMyTurn;
+      return;
+    }
+
+    // Round 14 finishes the whole game instead of ending into another round.
+    if (prev.phase !== "GAME_OVER" && next.phase === "GAME_OVER") {
+      sound.play("gameEnd");
+    } else if (prev.phase !== "ROUND_END" && next.phase === "ROUND_END") {
+      sound.play("roundEnd");
+    }
+
+    if (next.phase === "PLAYING") {
+      // My turn just began — fire on the rising edge of "it's my turn" rather
+      // than a turnSeat diff, so a coalesced/missed patch can't swallow it.
+      // Only the active player hears this one.
+      if (isMyTurn && !this.wasMyTurn) sound.play("turnStart");
+
+      // The active player drew: the only thing that moves DRAW -> ACT in a turn
+      // (covers drawing from either the pile or the discard).
+      const drewCard =
+        prev.turnSeat === next.turnSeat &&
+        prev.turnPhase === "DRAW" &&
+        next.turnPhase === "ACT";
+      if (drewCard) sound.play("drawCard");
+
+      // Card sound: a hand played / beanie inserted-reclaimed (field changed),
+      // or a card discarded (discard-pile top changed) — but not when that top
+      // changed because a card was drawn FROM the discard (that's drewCard), nor
+      // for a discarded Beanie (that gets its own beanieDrop sound). Skipped
+      // across a round boundary, which resets both the field and the discard.
+      if (next.round === prev.round) {
+        const fieldChanged = fieldSig(next) !== fieldSig(prev);
+        const discardedBeanie =
+          next.hasDiscard && next.discardTop!.rank === next.beanieRank;
+        const discarded =
+          discardSig(prev) !== discardSig(next) && !drewCard && !discardedBeanie;
+        if (fieldChanged || discarded) sound.play("playingCard");
+      }
+    }
+
+    this.wasMyTurn = isMyTurn;
   }
 
   async create(name: string) {
@@ -180,8 +278,9 @@ class BeanieStore {
     } catch {
       this.clearSession(); // token expired or seat gone — fall back to home
       if (manual) {
-        this.error =
-          "Couldn't rejoin — that game has ended or the rejoin window has passed.";
+        this.setError(
+          "Couldn't rejoin — that game has ended or the rejoin window has passed."
+        );
       }
       return false;
     } finally {
@@ -207,7 +306,7 @@ class BeanieStore {
       const room = await fn();
       this.bind(room);
     } catch (e: any) {
-      this.error = e?.message ?? "Could not connect. Is the server running?";
+      this.setError(e?.message ?? "Could not connect. Is the server running?");
     } finally {
       this.connecting = false;
       this.emit();
@@ -223,7 +322,10 @@ class BeanieStore {
     this.saveSession(room);
 
     room.onStateChange((state: any) => {
-      this.snapshot = toPlain(state);
+      const prev = this.snapshot;
+      const next = toPlain(state);
+      this.snapshot = next;
+      this.playTransitionSounds(prev, next);
       // A finished game isn't worth resuming into.
       if (state.phase === "GAME_OVER") this.clearSession();
       this.emit();
@@ -234,18 +336,38 @@ class BeanieStore {
       this.emit();
     });
     room.onMessage("error", (msg: any) => {
-      this.error = msg.message;
+      this.setError(msg.message);
+    });
+    // The server needs the player to pick between valid readings of a hand
+    // (e.g. Set vs Run, or which end a Beanie extends) before it can commit.
+    room.onMessage("playOptions", (msg: any) => {
+      this.pendingChoice = {
+        action: "play",
+        options: msg.options ?? [],
+        cardIds: msg.cardIds,
+      };
+      this.emit();
+    });
+    room.onMessage("insertOptions", (msg: any) => {
+      this.pendingChoice = {
+        action: "insert",
+        options: msg.options ?? [],
+        fieldId: msg.fieldId,
+        cardId: msg.cardId,
+      };
       this.emit();
     });
     room.onMessage("notice", (msg: any) => {
       this.notice = msg.message;
+      // The only notice today is the Beanie-discard penalty.
+      if (/beanie/i.test(msg.message ?? "")) sound.play("beanieDrop");
       this.emit();
       setTimeout(() => {
         if (this.notice === msg.message) {
           this.notice = null;
           this.emit();
         }
-      }, 3500);
+      }, 1200);
     });
     room.onLeave((code: number) => {
       this.room = null;
@@ -327,6 +449,48 @@ class BeanieStore {
   send(type: string, payload?: any) {
     this.room?.send(type, payload);
   }
+
+  /** Re-send the pending play/insert with the chosen interpretation. */
+  resolveChoice(seq: string) {
+    const c = this.pendingChoice;
+    if (!c) return;
+    if (c.action === "play") {
+      this.send("playHand", { cardIds: c.cardIds, seq });
+    } else {
+      this.send("insert", { fieldId: c.fieldId, cardId: c.cardId, seq });
+    }
+    this.pendingChoice = null;
+    this.emit();
+  }
+
+  cancelChoice() {
+    this.pendingChoice = null;
+    this.emit();
+  }
+
+  /** Sound-effect volume, 0 (silent) to 1 (full). */
+  get volume(): number {
+    return sound.volume;
+  }
+  /** Set the volume preference (persisted across sessions) and re-render. */
+  setVolume(v: number) {
+    sound.setVolume(v);
+    this.emit();
+  }
+
+  /** Show an error toast that auto-dismisses after 5s (or on manual clear). */
+  private setError(message: string) {
+    this.error = message;
+    sound.play("error");
+    this.emit();
+    setTimeout(() => {
+      if (this.error === message) {
+        this.error = null;
+        this.emit();
+      }
+    }, 5000);
+  }
+
   clearError() {
     this.error = null;
     this.emit();

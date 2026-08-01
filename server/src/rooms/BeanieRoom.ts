@@ -12,10 +12,12 @@ import {
   beanieRankForRound,
   isBeanie,
   dealRound,
-  validateHand,
-  tryInsert,
-  tryReclaim,
-  orderPlayedHand,
+  enumeratePlays,
+  insertIntoPlacement,
+  reclaimFromPlacement,
+  PlayOption,
+  PlacedCard,
+  HandKind,
   scoreRound,
   applyBonus,
   BonusChoice,
@@ -28,23 +30,29 @@ import {
   BonusEventSchema,
 } from "../schema.js";
 
-const RECONNECT_SECONDS = 120;
+const RECONNECT_SECONDS = 300; // 5 minutes — generous for a casual friends game
 
 // ---- small conversion helpers between engine cards and schema cards ----
-const ec = (rank: number, suit: string): Card => ({
-  rank: rank as Rank,
-  suit: suit as Suit,
-});
-function toSchemaCard(card: Card): CardSchema {
+function toSchemaCard(card: PlacedCard | Card): CardSchema {
   const cs = new CardSchema();
   cs.rank = card.rank;
   cs.suit = card.suit;
+  // Natural cards (and plain Cards) represent themselves.
+  cs.assignedRank = (card as PlacedCard).assignedRank ?? card.rank;
   return cs;
 }
-function toArraySchema(cards: Card[]): ArraySchema<CardSchema> {
+function toArraySchema(cards: (PlacedCard | Card)[]): ArraySchema<CardSchema> {
   const arr = new ArraySchema<CardSchema>();
   for (const c of cards) arr.push(toSchemaCard(c));
   return arr;
+}
+/** Read a field hand's schema cards back into engine placements. */
+function toPlaced(cards: ArraySchema<CardSchema>): PlacedCard[] {
+  return cards.map((c: CardSchema) => ({
+    rank: c.rank as Rank,
+    suit: c.suit as Suit,
+    assignedRank: (c.assignedRank || c.rank) as Rank,
+  }));
 }
 
 export class BeanieRoom extends Room<GameState> {
@@ -77,7 +85,7 @@ export class BeanieRoom extends Room<GameState> {
     this.onMessage("reclaim", (client, msg) => this.handleReclaim(client, msg));
     this.onMessage("discard", (client, msg) => this.handleDiscard(client, msg));
     this.onMessage("bonus", (client, msg) => this.handleBonus(client, msg));
-    this.onMessage("nextRound", (client) => this.handleNextRound(client));
+    this.onMessage("ready", (client) => this.handleReady(client));
     // Client asks for its private hand after (re)connecting.
     this.onMessage("requestHand", (client) => {
       const p = this.playerByClient(client);
@@ -114,6 +122,9 @@ export class BeanieRoom extends Room<GameState> {
       this.removePlayer(p.seat);
       return;
     }
+
+    // If we were waiting on this player to ready up, don't stall the others.
+    this.maybeStartNextRound();
 
     // Mid-game: keep the seat and allow a reconnection window.
     try {
@@ -168,8 +179,28 @@ export class BeanieRoom extends Room<GameState> {
     this.startRound();
   }
 
-  private handleNextRound(client: Client) {
-    if (!this.requireHost(client) || this.state.phase !== "ROUND_END") return;
+  /**
+   * A player readies up for the next round. The round starts automatically once
+   * every connected player has readied — no single host gates it.
+   */
+  private handleReady(client: Client) {
+    if (this.state.phase !== "ROUND_END") return;
+    const p = this.playerByClient(client);
+    if (!p) return;
+    p.ready = true;
+    this.maybeStartNextRound();
+  }
+
+  /** Start the next round once every connected player has readied. */
+  private maybeStartNextRound() {
+    if (this.state.phase !== "ROUND_END") return;
+    const waiting = this.state.players.filter(
+      (pl: PlayerSchema) => pl.connected && !pl.ready
+    );
+    if (waiting.length === 0) this.advanceToNextRound();
+  }
+
+  private advanceToNextRound() {
     this.state.round += 1;
     const n = this.state.players.length;
     // Rotate the opening player each round (fixed direction).
@@ -201,6 +232,7 @@ export class BeanieRoom extends Room<GameState> {
     s.players.forEach((p: PlayerSchema) => {
       p.hasPlayed = false;
       p.tookTurn = false;
+      p.ready = false;
       p.handCount = this.hands[p.seat].length;
     });
 
@@ -248,19 +280,40 @@ export class BeanieRoom extends Room<GameState> {
     this.sendHand(p.seat);
   }
 
-  private handlePlay(client: Client, msg: { cardIds?: string[] }) {
+  private handlePlay(client: Client, msg: { cardIds?: string[]; seq?: string }) {
     const p = this.requireTurn(client, "ACT");
     if (!p) return;
 
     const cards = this.takeFromHandPreview(p.seat, msg?.cardIds ?? []);
     if (!cards) return this.error(client, "Those cards aren't in your hand.");
 
-    const check = validateHand(cards, this.state.beanieRank as Rank);
-    if (!check.valid) return this.error(client, check.reason ?? "Invalid hand.");
+    const beanieRank = this.state.beanieRank as Rank;
+    let options = enumeratePlays(cards, beanieRank);
 
     // Round 14: only a 7-card straight flush may be played.
-    if (this.state.round === 14 && !(check.kind === "FLUSH" && cards.length === 7)) {
-      return this.error(client, "Round 14 only allows a 7-card straight flush.");
+    if (this.state.round === 14) {
+      options = options.filter((o) => o.kind === "FLUSH" && o.cards.length === 7);
+      if (options.length === 0) {
+        return this.error(client, "Round 14 only allows a 7-card straight flush.");
+      }
+    }
+    if (options.length === 0) {
+      return this.error(client, "That's not a valid set or straight flush.");
+    }
+
+    // More than one valid reading (e.g. [4,5,🫘] = 3-4-5 or 4-5-6; [4,🫘,🫘] =
+    // a Set or several runs). Ask the player to choose unless they already have.
+    const chosen = this.chooseOption(options, msg?.seq);
+    if (!chosen) {
+      return client.send("playOptions", {
+        cardIds: msg?.cardIds,
+        options: options.map((o) => ({
+          seq: o.seq,
+          label: o.label,
+          kind: o.kind,
+          cards: o.cards,
+        })),
+      });
     }
 
     const remaining = this.hands[p.seat].length - cards.length;
@@ -271,13 +324,13 @@ export class BeanieRoom extends Room<GameState> {
       return this.error(client, "You can't play out during the first rotation.");
     }
 
-    // Commit: remove cards from hand, add a field hand.
+    // Commit: remove cards from hand, add the chosen placement to the field.
     this.removeFromHand(p.seat, cards);
     const fh = new FieldHandSchema();
     fh.id = `f${this.fieldSeq++}`;
     fh.ownerSeat = p.seat;
-    fh.kind = check.kind!;
-    fh.cards = toArraySchema(orderPlayedHand(cards, this.state.beanieRank as Rank));
+    fh.kind = chosen.kind;
+    fh.cards = toArraySchema(chosen.cards);
     this.state.field.push(fh);
 
     p.hasPlayed = true;
@@ -285,12 +338,26 @@ export class BeanieRoom extends Room<GameState> {
 
     this.turnPlays += 1;
     this.turnSingle7Flush =
-      this.turnPlays === 1 && check.kind === "FLUSH" && cards.length === 7;
+      this.turnPlays === 1 && chosen.kind === "FLUSH" && chosen.cards.length === 7;
 
     this.sendHand(p.seat);
   }
 
-  private handleInsert(client: Client, msg: { fieldId?: string; cardId?: string }) {
+  /**
+   * Resolve which play/insert option to use. A single option is chosen
+   * automatically; with several, the caller-supplied `seq` must match one, else
+   * null is returned so the caller can prompt the player.
+   */
+  private chooseOption(options: PlayOption[], seq?: string): PlayOption | null {
+    if (options.length === 1) return options[0];
+    if (!seq) return null;
+    return options.find((o) => o.seq === seq) ?? null;
+  }
+
+  private handleInsert(
+    client: Client,
+    msg: { fieldId?: string; cardId?: string; seq?: string }
+  ) {
     const p = this.requireTurn(client, "ACT");
     if (!p) return;
     if (this.guardActionable(client, p) !== true) return;
@@ -301,9 +368,28 @@ export class BeanieRoom extends Room<GameState> {
     const card = this.findInHand(p.seat, msg?.cardId);
     if (!card) return this.error(client, "That card isn't in your hand.");
 
-    const fieldCards = fh.cards.map((c: CardSchema) => ec(c.rank, c.suit));
-    const res = tryInsert(fieldCards, card, this.state.beanieRank as Rank);
+    const res = insertIntoPlacement(
+      toPlaced(fh.cards),
+      fh.kind as HandKind,
+      card,
+      this.state.beanieRank as Rank
+    );
     if (!res.ok) return this.error(client, res.reason ?? "Can't insert there.");
+
+    // A Beanie that can extend either end of a run gives two placements to pick.
+    const chosen = this.chooseOption(res.options!, msg?.seq);
+    if (!chosen) {
+      return client.send("insertOptions", {
+        fieldId: msg?.fieldId,
+        cardId: msg?.cardId,
+        options: res.options!.map((o) => ({
+          seq: o.seq,
+          label: o.label,
+          kind: o.kind,
+          cards: o.cards,
+        })),
+      });
+    }
 
     const remaining = this.hands[p.seat].length - 1;
     if (remaining < 1) {
@@ -314,10 +400,8 @@ export class BeanieRoom extends Room<GameState> {
     }
 
     this.removeFromHand(p.seat, [card]);
-    fh.cards = toArraySchema(
-      orderPlayedHand(res.newFieldCards!, this.state.beanieRank as Rank)
-    );
-    fh.kind = res.kind!;
+    fh.cards = toArraySchema(chosen.cards);
+    fh.kind = chosen.kind;
     p.handCount = this.hands[p.seat].length;
 
     this.turnInserts += 1;
@@ -339,16 +423,18 @@ export class BeanieRoom extends Room<GameState> {
     const card = this.findInHand(p.seat, msg?.cardId);
     if (!card) return this.error(client, "That card isn't in your hand.");
 
-    const fieldCards = fh.cards.map((c: CardSchema) => ec(c.rank, c.suit));
-    const res = tryReclaim(fieldCards, card, this.state.beanieRank as Rank);
+    const res = reclaimFromPlacement(
+      toPlaced(fh.cards),
+      fh.kind as HandKind,
+      card,
+      this.state.beanieRank as Rank
+    );
     if (!res.ok) return this.error(client, res.reason ?? "Can't reclaim that.");
 
     // Swap: provided card into the field hand, beanie back to the player.
     this.removeFromHand(p.seat, [card]);
     this.hands[p.seat].push(res.returnedBeanie!);
-    fh.cards = toArraySchema(
-      orderPlayedHand(res.newFieldCards!, this.state.beanieRank as Rank)
-    );
+    fh.cards = toArraySchema(res.newCards!);
     p.handCount = this.hands[p.seat].length;
 
     this.turnReclaims += 1;

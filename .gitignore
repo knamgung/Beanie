@@ -30,4 +30,4 @@ Thumbs.db
 .idea/
 
 # Claude Code local settings (keep shared config, ignore personal/local)
-.claude/
+.claude/settings.local.json

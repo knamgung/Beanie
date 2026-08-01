@@ -5,8 +5,11 @@
 import { Schema, type, ArraySchema } from "@colyseus/schema";
 
 export class CardSchema extends Schema {
-  @type("number") rank = 0; // 1..13 (1 = Ace)
+  @type("number") rank = 0; // 1..13 (1 = Ace) — the physical card's rank
   @type("string") suit = ""; // C | D | H | S
+  // The rank this card represents in a played hand. For a natural card this
+  // equals `rank`; for a Beanie (wild) it's the value the player locked it to.
+  @type("number") assignedRank = 0;
 }
 
 export class PlayerSchema extends Schema {
@@ -21,6 +24,7 @@ export class PlayerSchema extends Schema {
   @type("number") handCount = 0; // number of cards in hand (public count)
   @type("boolean") hasPlayed = false; // owns a played hand this round?
   @type("boolean") tookTurn = false; // has taken a turn this round?
+  @type("boolean") ready = false; // readied up to start the next round?
 }
 
 export class FieldHandSchema extends Schema {
