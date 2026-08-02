@@ -64,6 +64,7 @@ export interface Snapshot {
   players: PlayerView[];
   field: FieldHandView[];
   bonuses: BonusEventView[];
+  wheelNonce: number;
 }
 
 export interface HandCard {
@@ -134,6 +135,7 @@ function toPlain(s: any): Snapshot {
       winnerSeat: b.winnerSeat,
       choice: b.choice,
     })),
+    wheelNonce: s.wheelNonce,
   };
 }
 

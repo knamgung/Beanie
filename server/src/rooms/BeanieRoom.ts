@@ -117,8 +117,8 @@ export class BeanieRoom extends Room<GameState> {
     if (!p) return;
     p.connected = false;
 
-    // In the lobby, a leaver is simply removed and seats re-pack.
-    if (this.state.phase === "LOBBY") {
+    // Intentional leave (tapped "Leave") in the lobby: free the seat now.
+    if (this.state.phase === "LOBBY" && consented) {
       this.removePlayer(p.seat);
       return;
     }
@@ -126,16 +126,20 @@ export class BeanieRoom extends Room<GameState> {
     // If we were waiting on this player to ready up, don't stall the others.
     this.maybeStartNextRound();
 
-    // Mid-game: keep the seat and allow a reconnection window.
+    // Otherwise hold the seat for a reconnection window. This covers an
+    // unexpected drop mid-game AND a lobby host backgrounding their phone's
+    // browser to copy/share the room code — the lobby (and room) survive until
+    // they return, instead of being disposed the moment the socket closes.
     try {
       await this.allowReconnection(client, RECONNECT_SECONDS);
       p.connected = true;
       this.seatClients[p.seat] = client;
       this.sendHand(p.seat);
     } catch {
-      // Reconnection window elapsed — leave the seat disconnected so the
-      // game state (their hand, score) stays intact for the others.
-      p.connected = false;
+      // Window elapsed. In the lobby, free the seat (re-packing so seats stay
+      // contiguous); mid-game, keep it disconnected so scores/hands persist.
+      if (this.state.phase === "LOBBY") this.removePlayer(p.seat);
+      else p.connected = false;
     }
   }
 
@@ -156,6 +160,9 @@ export class BeanieRoom extends Room<GameState> {
     if (!this.requireHost(client) || this.state.phase !== "LOBBY") return;
     const n = this.state.players.length;
     this.state.wheelResult = Math.floor(this.rng() * n);
+    // Bump the nonce so every client animates the wheel, even a re-spin that
+    // happens to land on the same seat as last time.
+    this.state.wheelNonce += 1;
   }
 
   private handleStartGame(client: Client) {
