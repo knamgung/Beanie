@@ -59,6 +59,7 @@ export class GameState extends Schema {
   @type("boolean") hasDiscard = false;
 
   @type("number") wheelResult = -1; // seat chosen by the opening wheel spin
+  @type("number") wheelNonce = 0; // increments each spin — drives the wheel animation
   @type("number") awaitingBonusSeat = -1; // winner must pick double/halve
 
   @type("string") roundWinnerName = "";
