@@ -28,6 +28,7 @@ export function Table() {
 
   const [selected, setSelected] = useState<string[]>([]);
   const [showScores, setShowScores] = useState(false);
+  const [confirmEnd, setConfirmEnd] = useState(false);
   const toggle = (id: string) =>
     setSelected((cur) =>
       cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
@@ -123,6 +124,11 @@ export function Table() {
           <button className="btn btn--small btn--ghost" onClick={() => setShowScores(true)}>
             📊 Scoreboard
           </button>
+          {me?.isHost && s.phase !== "GAME_OVER" && (
+            <button className="btn btn--small btn--ghost" onClick={() => setConfirmEnd(true)}>
+              🏳️ End game
+            </button>
+          )}
         </div>
       </header>
 
@@ -335,6 +341,33 @@ export function Table() {
             <h2>🫘 Game over!</h2>
             <GameWinner players={s.players} />
             <ScoreGrid players={s.players} bonuses={s.bonuses} currentRound={s.round} />
+            <button className="btn btn--primary" onClick={() => store.leaveGame()}>
+              Back to home
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* end-game confirmation (host) */}
+      {confirmEnd && (
+        <div className="overlay" onClick={() => setConfirmEnd(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2>End the game?</h2>
+            <p>This ends the game for everyone and shows the final scores.</p>
+            <div className="modal__actions">
+              <button
+                className="btn btn--primary"
+                onClick={() => {
+                  store.send("endGame");
+                  setConfirmEnd(false);
+                }}
+              >
+                End game
+              </button>
+              <button className="btn btn--ghost" onClick={() => setConfirmEnd(false)}>
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}
