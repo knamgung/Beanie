@@ -86,6 +86,7 @@ export class BeanieRoom extends Room<GameState> {
     this.onMessage("discard", (client, msg) => this.handleDiscard(client, msg));
     this.onMessage("bonus", (client, msg) => this.handleBonus(client, msg));
     this.onMessage("ready", (client) => this.handleReady(client));
+    this.onMessage("endGame", (client) => this.handleEndGame(client));
     // Client asks for its private hand after (re)connecting.
     this.onMessage("requestHand", (client) => {
       const p = this.playerByClient(client);
@@ -196,6 +197,18 @@ export class BeanieRoom extends Room<GameState> {
     if (!p) return;
     p.ready = true;
     this.maybeStartNextRound();
+  }
+
+  /**
+   * Host ends the game early. Jumps straight to GAME_OVER with the current
+   * cumulative scores, so everyone sees the final standings (same screen as a
+   * natural round-14 finish). Only valid while a game is actually in progress.
+   */
+  private handleEndGame(client: Client) {
+    if (!this.requireHost(client)) return;
+    if (this.state.phase !== "PLAYING" && this.state.phase !== "ROUND_END") return;
+    this.state.awaitingBonusSeat = -1;
+    this.state.phase = "GAME_OVER";
   }
 
   /** Start the next round once every connected player has readied. */

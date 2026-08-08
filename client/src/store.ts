@@ -273,17 +273,36 @@ class BeanieStore {
     this.connecting = true;
     this.error = null;
     this.emit();
+    // Retry a few times: a brief network blip shouldn't cost the seat, which
+    // the server holds for the full reconnection window. Crucially, we do NOT
+    // clear the token on a failed *automatic* resume — otherwise a transient
+    // drop discards the key while the server is still holding the seat, and the
+    // player is left with only a fresh join (rejected mid-game as "Game already
+    // in progress."). A failed *manual* attempt does clear it, since the user
+    // explicitly tried and it's genuinely unrecoverable.
+    const attempts = manual ? 2 : 5;
     try {
-      const room = await this.client.reconnect(saved.token);
-      this.bind(room);
-      return true;
+      for (let i = 0; i < attempts; i++) {
+        try {
+          const room = await this.client.reconnect(saved.token);
+          this.bind(room);
+          return true;
+        } catch (e) {
+          if (i === attempts - 1) throw e;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+      return false;
     } catch {
-      this.clearSession(); // token expired or seat gone — fall back to home
       if (manual) {
+        this.clearSession();
         this.setError(
           "Couldn't rejoin — that game has ended or the rejoin window has passed."
         );
       }
+      // Auto-resume: keep the token so the player can retry from Home (the
+      // "Rejoin" button) while the seat is still held. Stale tokens are cleared
+      // on a failed manual attempt, on GAME_OVER, or when leaving.
       return false;
     } finally {
       this.connecting = false;
@@ -371,13 +390,15 @@ class BeanieStore {
         }
       }, 1200);
     });
-    room.onLeave((code: number) => {
+    room.onLeave(() => {
       this.room = null;
       this.snapshot = null;
       this.emit();
-      // Unexpected drop (not a clean 1000 close) → try to reclaim the seat
-      // within the server's reconnection window.
-      if (code !== 1000 && this.readSession()?.token) this.resume();
+      // A saved token only survives an UNEXPECTED drop — an intentional leave
+      // (leaveGame) and GAME_OVER both clear it first. So if a token is still
+      // here, the socket dropped on us; try to reclaim the held seat. We don't
+      // gate on code (Render's proxy can close a dropped socket with 1000).
+      if (this.readSession()?.token) this.resume();
     });
 
     // Ask the server to (re)send our private hand once handlers are attached,
